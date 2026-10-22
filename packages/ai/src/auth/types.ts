@@ -215,6 +215,11 @@ export interface LoginOptions {
 	 * Codex originator. Defaults to pi's own name.
 	 */
 	agentName?: string;
+	/**
+	 * Verified account identity (ID token `sub`) of the credential being replaced. A returning
+	 * sign-in that verifies as a different account is rejected instead of replacing it.
+	 */
+	expectedSubject?: string;
 }
 
 /**

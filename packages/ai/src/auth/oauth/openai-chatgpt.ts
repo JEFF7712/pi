@@ -7,6 +7,7 @@
 
 import { randomBytes } from "node:crypto";
 import { createServer, type Server, type ServerResponse } from "node:http";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 import { oauthErrorHtml, oauthSuccessHtml } from "../../utils/oauth-page.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { LoginOptions, OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
@@ -16,8 +17,10 @@ import { generatePKCE } from "./pkce.ts";
 const DYNAMIC_CLIENT_ID = "dynamic_agent_client";
 const AGENT_NAME_HINT = "Pi";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const AUTHORIZE_URL = "https://auth.openai.com/api/accounts/authorize";
-const TOKEN_URL = "https://auth.openai.com/api/accounts/oauth/token";
+const ISSUER = "https://auth.openai.com";
+const JWKS_URL = `${ISSUER}/.well-known/jwks.json`;
+const AUTHORIZE_URL = `${ISSUER}/api/accounts/authorize`;
+const TOKEN_URL = `${ISSUER}/api/accounts/oauth/token`;
 const RESOURCE = "https://api.openai.com/v1";
 const CALLBACK_HOST = getProviderEnvValue("PI_OAUTH_CALLBACK_HOST") || "127.0.0.1";
 const CALLBACK_PORT = 1455;
@@ -159,6 +162,44 @@ function requireTokenString(value: unknown, field: "access_token" | "refresh_tok
 	return value;
 }
 
+/**
+ * Verify an OpenAI ID token as Sign in with ChatGPT requires: RS256 signature against OpenAI's
+ * published JWKS, issuer, audience equal to the issued client ID, expiry, and, for a new
+ * authorization, the nonce sent with it. Returns the verified `sub`, the account identity.
+ */
+async function verifyIdToken(idToken: unknown, clientId: string, nonce: string | undefined): Promise<string> {
+	if (typeof idToken !== "string" || idToken.trim().length === 0) {
+		throw new Error("OpenAI OAuth token response did not contain an ID token");
+	}
+	let payload: Record<string, unknown>;
+	try {
+		({ payload } = await jwtVerify(idToken, createRemoteJWKSet(new URL(JWKS_URL)), {
+			issuer: ISSUER,
+			audience: clientId,
+			algorithms: ["RS256"],
+			requiredClaims: ["sub", "exp"],
+		}));
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		throw new Error(`OpenAI OAuth ID token failed verification: ${reason}`);
+	}
+	if (nonce !== undefined && payload.nonce !== nonce) {
+		throw new Error("OpenAI OAuth ID token failed verification: nonce mismatch");
+	}
+	if (typeof payload.sub !== "string" || payload.sub.length === 0) {
+		throw new Error("OpenAI OAuth ID token failed verification: missing subject");
+	}
+	return payload.sub;
+}
+
+function requireSameAccount(subject: string, expected: unknown): void {
+	if (typeof expected === "string" && expected.length > 0 && expected !== subject) {
+		throw new Error(
+			"Signed in as a different ChatGPT account than the one this credential belongs to; keep the existing credential and sign in to that account, or remove it first",
+		);
+	}
+}
+
 function credentialFromTokenResponse(token: TokenResponse, clientId: string): OAuthCredential {
 	const access = requireTokenString(token.access_token, "access_token");
 	const refresh = requireTokenString(token.refresh_token, "refresh_token");
@@ -184,6 +225,8 @@ async function exchangeAuthorizationCode(
 	code: string,
 	verifier: string,
 	clientId: string,
+	nonce: string,
+	expectedSubject: string | undefined,
 	signal: AbortSignal,
 ): Promise<OAuthCredential> {
 	const token = await requestToken(
@@ -197,12 +240,10 @@ async function exchangeAuthorizationCode(
 		}),
 		signal,
 	);
-	// Pi does not use the ID token to identify the user or read profile data.
-	// Keep the presence check as part of the token-response contract.
-	if (typeof token.id_token !== "string" || token.id_token.trim().length === 0) {
-		throw new Error("OpenAI OAuth token response did not contain an ID token");
-	}
-	return credentialFromTokenResponse(token, clientId);
+	const credential = credentialFromTokenResponse(token, clientId);
+	const subject = await verifyIdToken(token.id_token, clientId, nonce);
+	requireSameAccount(subject, expectedSubject);
+	return { ...credential, subject };
 }
 
 async function refreshAccessToken(credential: OAuthCredential, signal: AbortSignal): Promise<OAuthCredential> {
@@ -219,7 +260,12 @@ async function refreshAccessToken(credential: OAuthCredential, signal: AbortSign
 		}),
 		signal,
 	);
-	return credentialFromTokenResponse(token, clientId);
+	const refreshed = credentialFromTokenResponse(token, clientId);
+	// A refresh response that carries an ID token must still belong to the stored account.
+	if (token.id_token === undefined) return { ...refreshed, subject: credential.subject };
+	const subject = await verifyIdToken(token.id_token, clientId, undefined);
+	requireSameAccount(subject, credential.subject);
+	return { ...refreshed, subject };
 }
 
 /** OpenAI identifies each installation ("agent host") by a stable URI such as `urn:uuid:<uuid>`. */
@@ -281,7 +327,14 @@ async function loginOpenAIChatGPT(
 	try {
 		const result = await Promise.race([callback.result, manualCode]);
 		interaction.notify({ type: "progress", message: "Exchanging authorization code for tokens..." });
-		return await exchangeAuthorizationCode(result.code, verifier, result.clientId, interaction.signal);
+		return await exchangeAuthorizationCode(
+			result.code,
+			verifier,
+			result.clientId,
+			nonce,
+			options?.expectedSubject,
+			interaction.signal,
+		);
 	} catch (error) {
 		if (interaction.signal.aborted) throw new Error("Login cancelled");
 		throw error;
