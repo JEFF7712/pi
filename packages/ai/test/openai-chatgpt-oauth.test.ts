@@ -132,6 +132,7 @@ function connectedCredential(subject: string | undefined = ACCOUNT): OAuthCreden
 	};
 }
 
+// Regression coverage for https://github.com/earendil-works/pi/issues/11313.
 describe("OpenAI ChatGPT OAuth", () => {
 	afterEach(() => {
 		vi.unstubAllGlobals();
